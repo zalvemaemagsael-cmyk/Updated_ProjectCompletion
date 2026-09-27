@@ -369,17 +369,20 @@ if n_total_filt < n_total_all:
     st.caption(f"Showing {n_total_filt} of {n_total_all} total projects, based on active filters.")
 
 # ==========================================================================
-# Tabs
+# Single-page layout (sections stacked top to bottom, no tabs)
 # ==========================================================================
-tab_overview, tab_atrisk, tab_profile, tab_analytics, tab_warning, tab_intervention = st.tabs(
-    [
-        "1. Risk Overview",
-        "2. At-Risk Projects",
-        "3. Project Risk Profile",
-        "4. Risk Analytics",
-        "5. Early Warning",
-        "6. Intervention Monitoring",
-    ]
+st.markdown(
+    """
+    <div style="font-size:0.85rem; margin: 4px 0 18px 0;">
+        <a href="#risk-overview" style="margin-right:14px; text-decoration:none;">1. Risk Overview</a>
+        <a href="#at-risk-projects" style="margin-right:14px; text-decoration:none;">2. At-Risk Projects</a>
+        <a href="#project-risk-profile" style="margin-right:14px; text-decoration:none;">3. Project Risk Profile</a>
+        <a href="#risk-analytics" style="margin-right:14px; text-decoration:none;">4. Risk Analytics</a>
+        <a href="#early-warning" style="margin-right:14px; text-decoration:none;">5. Early Warning</a>
+        <a href="#intervention-monitoring" style="text-decoration:none;">6. Intervention Monitoring</a>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
 
@@ -390,7 +393,8 @@ def tier_style(val):
 # --------------------------------------------------------------------------
 # 1. RISK OVERVIEW
 # --------------------------------------------------------------------------
-with tab_overview:
+st.header("1. Risk Overview", anchor="risk-overview")
+with st.container():
     n_atrisk = int((filt["Risk_Level"] != "Low").sum())
     n_critical = int((filt["Risk_Level"] == "Critical").sum())
     avg_prob = filt["Completion_Probability"].mean() * 100 if len(filt) else float("nan")
@@ -418,7 +422,9 @@ with tab_overview:
 # --------------------------------------------------------------------------
 # 2. AT-RISK PROJECTS
 # --------------------------------------------------------------------------
-with tab_atrisk:
+st.divider()
+st.header("2. At-Risk Projects", anchor="at-risk-projects")
+with st.container():
     st.markdown("##### Searchable list of projects, sorted highest-risk first")
     colf1, colf2 = st.columns([3, 1])
     search = colf1.text_input("Search by beneficiary or Project ID", "")
@@ -467,7 +473,9 @@ with tab_atrisk:
 # --------------------------------------------------------------------------
 # 3. PROJECT RISK PROFILE
 # --------------------------------------------------------------------------
-with tab_profile:
+st.divider()
+st.header("3. Project Risk Profile", anchor="project-risk-profile")
+with st.container():
     if filt.empty:
         st.info("No projects match the current filters.")
     else:
@@ -554,7 +562,9 @@ with tab_profile:
 # --------------------------------------------------------------------------
 # 4. RISK ANALYTICS
 # --------------------------------------------------------------------------
-with tab_analytics:
+st.divider()
+st.header("4. Risk Analytics", anchor="risk-analytics")
+with st.container():
     st.markdown("##### Risk Patterns")
     dim = st.radio(
         "Break down by", ["Province", "Sector", "Enterprise Size", "Ownership Type", "Year"],
@@ -629,7 +639,9 @@ with tab_analytics:
 # --------------------------------------------------------------------------
 # 5. EARLY WARNING
 # --------------------------------------------------------------------------
-with tab_warning:
+st.divider()
+st.header("5. Early Warning", anchor="early-warning")
+with st.container():
     st.markdown("##### Automatically Flagged Projects")
     st.caption(
         "This dataset has one record per project (no monthly history), so the panel-data notions of "
@@ -694,7 +706,9 @@ with tab_warning:
 # --------------------------------------------------------------------------
 # 6. INTERVENTION MONITORING
 # --------------------------------------------------------------------------
-with tab_intervention:
+st.divider()
+st.header("6. Intervention Monitoring", anchor="intervention-monitoring")
+with st.container():
     st.markdown("##### Intervention Monitoring Log")
     st.caption(
         "System suggestions for prioritization \u2014 not official DOST decisions. "
