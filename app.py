@@ -8,13 +8,14 @@ Loads a pre-trained Logistic Regression pipeline (StandardScaler + OneHotEncoder
 project on Completion_Probability, and surfaces which projects are at risk of
 not completing, why, and which need intervention.
 
-NOTE ON THIS VERSION: the dataset backing this dashboard is now one row per
-project (no monthly panel), and the model uses 11 predictors (7 numeric +
-4 categorical: Province, Sector, type_of_ownership, size_of_enterprise).
-There is no time dimension per project, so month-over-month trend charts and
-"declining probability" / "persistent risk" flags from a panel-data design
-are not possible here -- see the Early Warning and Project Risk Profile
-sections for how those were adapted to this dataset instead of faked.
+DATA SOURCES
+  * LIVE: submitted project proposals read from Supabase (jsonb sections).
+    The seven model variables are feature-engineered from each proposal by
+    proposal_features.py, following the Feature Engineering spec.
+  * DEMO: if no Supabase secrets are configured, falls back to MSME_filled.xlsx.
+
+There is one record per project (no monthly panel), so month-over-month trends
+are not possible; Early Warning and Project Risk Profile are adapted to that.
 """
 
 from pathlib import Path
@@ -23,9 +24,12 @@ from datetime import date
 
 import numpy as np
 import pandas as pd
+import requests
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+
+from proposal_features import MODEL_NUMERIC, proposals_to_frame
 
 # ==========================================================================
 # Paths & page config
@@ -90,6 +94,13 @@ NUMERIC_LABELS = {
 }
 CATEGORICAL_COLS = ["Province", "Sector", "type_of_ownership", "size_of_enterprise"]
 
+# Columns pulled from the proposals table. 'annex' (image attachments) and the
+# pdf_* columns are skipped on purpose: they are large and not needed for scoring.
+PROPOSAL_SELECT = (
+    "id,user_id,status,created_at,updated_at,proposal_json,project_background,"
+    "marketing_aspect,technological_aspect,waste_management,financial_aspect,risk_management"
+)
+
 # --------------------------------------------------------------------------
 # Light CSS polish
 # --------------------------------------------------------------------------
@@ -135,6 +146,35 @@ def load_model(path: Path):
         return pickle.load(f)
 
 
+def supabase_cfg():
+    """Reads .streamlit/secrets.toml -> [supabase] url, service_key, proposals_table, pis_table (optional)."""
+    try:
+        cfg = dict(st.secrets["supabase"])
+        return cfg if cfg.get("url") and cfg.get("service_key") else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=300, show_spinner="Fetching proposals from Supabase\u2026")
+def fetch_table(url: str, key: str, table: str, select: str = "*", page: int = 500) -> list:
+    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    rows, start = [], 0
+    while True:
+        h = {**headers, "Range-Unit": "items", "Range": f"{start}-{start + page - 1}"}
+        r = requests.get(f"{url.rstrip('/')}/rest/v1/{table}", headers=h, params={"select": select}, timeout=30)
+        r.raise_for_status()
+        batch = r.json()
+        rows += batch
+        if len(batch) < page:
+            return rows
+        start += page
+
+
+@st.cache_data(ttl=300, show_spinner="Engineering model variables from proposals\u2026")
+def build_live_data(rows: list, pis_rows: list, pis_columns: dict):
+    return proposals_to_frame(rows, pis_rows, pis_columns)
+
+
 @st.cache_data(show_spinner=False)
 def load_data(path: Path) -> pd.DataFrame:
     df = pd.read_excel(path)
@@ -146,13 +186,14 @@ def load_data(path: Path) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def score_projects(df: pd.DataFrame, _model) -> tuple[pd.DataFrame, list, list, np.ndarray]:
+def score_projects(df: pd.DataFrame, _model) -> tuple:
     """Score every project and reconstruct the linear model's own contribution
     per transformed feature (numeric z-scores + active one-hot categories),
     so 'why flagged' is read directly off the fitted coefficients -- no SHAP
     needed for a linear model."""
     feat_cols = list(_model.feature_names_in_)
     numeric_cols = [c for c in feat_cols if c not in CATEGORICAL_COLS]
+    df = df.reset_index(drop=True)
 
     X = df[feat_cols]
     proba = _model.predict_proba(X)[:, 1]  # P(Completed)
@@ -197,28 +238,30 @@ def classify_tier(prob_pct: float, t_crit: float, t_high: float, t_med: float) -
     return "Low"
 
 
-def _numeric_phrase(col: str, value: float, mean: float) -> str:
-    label = NUMERIC_LABELS.get(col, col)
-    if col == "Debt-service coverage":
-        if value < 1.0:
-            return (
-                f"Debt-service coverage is critically low at {value:.2f}\u00d7 \u2014 below the "
-                f"1.0 break-even point needed to cover debt obligations."
-            )
-        return f"Debt-service coverage is soft at {value:.2f}\u00d7, below the typical {mean:.2f}\u00d7."
-    if col == "Current capacity utilization rate":
-        return f"Current capacity utilization is low at {value:.1f}%, versus a typical {mean:.1f}%."
-    if col == "net_profit_margin":
-        return f"Net profit margin is thin at {value:.1f}%, versus a typical {mean:.1f}%."
-    if col == "Penetration Rate":
-        return f"Market penetration rate is low at {value:.1f}%, versus a typical {mean:.1f}%."
-    if col == "Years in operation":
-        return f"The firm is relatively young at {value:.0f} year(s) in operation, versus a typical {mean:.1f}."
-    if col == "Total Employment":
-        return f"Total employment is low at {value:.0f}, versus a typical {mean:.0f}."
+def _fmt_num(col: str, v: float) -> str:
     if col == "Total Assets":
-        return f"Total assets are low at \u20b1{value:,.0f}, versus a typical \u20b1{mean:,.0f}."
-    return f"{label} is below the typical range ({value})."
+        return f"\u20b1{v:,.0f}"
+    if col == "Debt-service coverage":
+        return f"{v:.2f}\u00d7"
+    if col in ("Total Employment", "Years in operation"):
+        return f"{v:,.0f}"
+    return f"{v:.1f}%"
+
+
+def _numeric_phrase(col: str, value: float, mean: float) -> str:
+    """The model pushed this project toward 'Not Completed' because of this variable.
+    The wording follows the actual direction of the value (a negative coefficient can
+    penalise a HIGH value), instead of always saying 'low'."""
+    label = NUMERIC_LABELS.get(col, col).split(" (")[0]
+    if col == "Debt-service coverage" and value < 1.0:
+        return (f"Debt-service coverage is critically low at {value:.2f}\u00d7 \u2014 below the "
+                f"1.0 break-even point needed to cover debt obligations.")
+    if abs(value - mean) <= 0.01 * max(abs(mean), 1e-9):
+        return (f"{label} ({_fmt_num(col, value)}) is close to the portfolio average "
+                f"({_fmt_num(col, mean)}), but the fitted model still weighs it against completion.")
+    direction = "below" if value < mean else "above"
+    return (f"{label} ({_fmt_num(col, value)}) is {direction} the portfolio average "
+            f"({_fmt_num(col, mean)}), which the fitted model weighs against completion.")
 
 
 def _categorical_phrase(col: str, value: str) -> str:
@@ -270,8 +313,70 @@ def project_label(row: pd.Series) -> str:
 # Load & score
 # ==========================================================================
 model = load_model(MODEL_PATH)
-raw_df = load_data(DATA_PATH)
-scored, feat_cols, numeric_cols, contrib_matrix, out_names, unmapped_categories = score_projects(raw_df, model)
+MODEL_COLS = list(model.feature_names_in_)
+
+
+def align_categories(df: pd.DataFrame, mdl) -> pd.DataFrame:
+    """Map incoming category labels onto the exact labels the encoder was trained on
+    (case/space-insensitive), so 'Medium' matches a trained 'medium' instead of being
+    silently zeroed out by handle_unknown='ignore'."""
+    df = df.copy()
+    try:
+        pre = mdl.named_steps["preprocessor"]
+        for _, trans, cols in pre.transformers_:
+            enc = trans.steps[-1][1] if hasattr(trans, "steps") else trans
+            if not hasattr(enc, "categories_"):
+                continue
+            for col, cats in zip(cols, enc.categories_):
+                if col in df:
+                    lookup = {str(c).strip().lower(): c for c in cats}
+                    df[col] = df[col].map(lambda v: lookup.get(str(v).strip().lower(), v))
+    except Exception:
+        pass
+    return df
+
+
+cfg = supabase_cfg()
+audit_df = pd.DataFrame()
+if cfg:
+    DATA_MODE = "live"
+    try:
+        _rows = fetch_table(cfg["url"], cfg["service_key"], cfg.get("proposals_table", "project_proposals"), PROPOSAL_SELECT)
+    except Exception as e:
+        st.error(f"Could not read proposals from Supabase: {e}")
+        st.stop()
+    _pis = []
+    if cfg.get("pis_table"):
+        try:
+            _pis = fetch_table(cfg["url"], cfg["service_key"], cfg["pis_table"], "*")
+        except Exception as e:
+            st.warning(f"PIS table could not be read ({e}). Falling back to proposal values for Total Assets and company characteristics.")
+    raw_df, audit_df = build_live_data(_rows, _pis, dict(cfg.get("pis_columns", {})))
+    if raw_df.empty:
+        st.warning("The proposals table returned no rows.")
+        st.stop()
+else:
+    DATA_MODE = "demo"
+    raw_df = load_data(DATA_PATH)
+
+for _c in MODEL_COLS:               # a column the model needs but the source lacks -> unscoreable, not a crash
+    if _c not in raw_df:
+        raw_df[_c] = np.nan
+raw_df = align_categories(raw_df, model)
+
+# Only projects with every model input can be scored.
+_complete = raw_df[MODEL_COLS].notna().all(axis=1)
+unscored_df = raw_df[~_complete].copy()
+if not unscored_df.empty:
+    unscored_df["Missing"] = unscored_df[MODEL_COLS].apply(
+        lambda r: ", ".join(c for c in MODEL_COLS if pd.isna(r[c])), axis=1)
+if not _complete.any():
+    st.error("No project has a complete set of model inputs, so none can be scored.")
+    st.dataframe(unscored_df, hide_index=True)
+    st.stop()
+
+scored, feat_cols, numeric_cols, contrib_matrix, out_names, unmapped_categories = score_projects(
+    raw_df[_complete].reset_index(drop=True), model)
 
 # Means of numeric columns, used only to phrase "typical" comparisons in reasons.
 _numeric_means = {c: scored[c].mean() for c in numeric_cols}
@@ -292,15 +397,49 @@ st.markdown(
     '<div class="workflow-strip">Monitor \u2192 Predict \u2192 Explain Risk \u2192 Prioritize \u2192 Intervene \u2192 Monitor</div>',
     unsafe_allow_html=True,
 )
-st.markdown(
-    """
-    <div class="demo-banner">
-        <b>DEMO MODE \u2014 Synthetic Data:</b> This dashboard uses synthetic data for demonstration.
-        Predictions and province/sector patterns do not represent actual DOST statistics.
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+if DATA_MODE == "demo":
+    st.markdown(
+        """
+        <div class="demo-banner">
+            <b>DEMO MODE \u2014 Synthetic Data:</b> No Supabase connection is configured, so this dashboard
+            is using synthetic data. Predictions and province/sector patterns do not represent actual DOST statistics.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+else:
+    bc1, bc2 = st.columns([6, 1])
+    bc1.success(
+        f"Live data: {len(raw_df)} proposal(s) read from Supabase \u00b7 {len(scored)} scored \u00b7 "
+        f"{len(unscored_df)} not scoreable (missing inputs). Refreshes every 5 minutes."
+    )
+    if bc2.button("Refresh now"):
+        st.cache_data.clear()
+        st.rerun()
+
+    n_fb = int((raw_df["Fallback_Inputs"].fillna("") != "").sum()) if "Fallback_Inputs" in raw_df else 0
+    n_warn = int((raw_df["Check_Warnings"].fillna("") != "").sum()) if "Check_Warnings" in raw_df else 0
+    with st.expander(f"Data quality \u2014 {len(unscored_df)} not scoreable \u00b7 {n_fb} using fallback/assumed inputs \u00b7 {n_warn} failing sanity checks", expanded=bool(len(unscored_df) or n_warn)):
+        if n_warn:
+            st.markdown("**Proposals whose extracted values failed a sanity check** (likely a wrong row/column was picked):")
+            st.dataframe(
+                raw_df.loc[raw_df["Check_Warnings"].fillna("") != "", ["Beneficiary_Name", "Project_ID", "Check_Warnings"]],
+                hide_index=True, width="stretch",
+            )
+        if len(unscored_df):
+            st.markdown("**Proposals that could not be scored** (a model input could not be read from the proposal):")
+            st.dataframe(
+                unscored_df[["Beneficiary_Name", "Project_ID", "Proposal_Status", "Missing"]],
+                hide_index=True, width="stretch",
+            )
+        if n_fb:
+            st.markdown("**Proposals using fallback / assumed inputs** (e.g. Total Assets from the proposal balance sheet because no PIS record was found):")
+            st.dataframe(
+                raw_df.loc[raw_df["Fallback_Inputs"].fillna("") != "", ["Beneficiary_Name", "Project_ID", "Fallback_Inputs"]],
+                hide_index=True, width="stretch",
+            )
+        if not len(unscored_df) and not n_fb and not n_warn:
+            st.write("All proposals were scored using primary sources.")
 
 if unmapped_categories:
     with st.expander(f"\u26A0\uFE0F Data quality note: {len(unmapped_categories)} record(s) contain category values not seen during model training", expanded=False):
@@ -322,8 +461,16 @@ provinces = st.sidebar.multiselect("Province", sorted(scored["Province"].unique(
 sectors = st.sidebar.multiselect("Sector", sorted(scored["Sector"].unique()))
 ownerships = st.sidebar.multiselect("Ownership Type", sorted(scored["type_of_ownership"].unique()))
 sizes = st.sidebar.multiselect("Enterprise Size", sorted(scored["size_of_enterprise"].str.title().unique()))
-yr_min, yr_max = int(scored["Year"].min()), int(scored["Year"].max())
-year_range = st.sidebar.slider("Year", yr_min, yr_max, (yr_min, yr_max))
+if "Proposal_Status" in scored and scored["Proposal_Status"].notna().any():
+    statuses = st.sidebar.multiselect("Proposal status", sorted(scored["Proposal_Status"].dropna().unique()))
+else:
+    statuses = []
+_years = scored["Year"].dropna().astype(int)
+yr_min, yr_max = (int(_years.min()), int(_years.max())) if len(_years) else (0, 0)
+if yr_min < yr_max:   # st.slider raises if min == max
+    year_range = st.sidebar.slider("Year", yr_min, yr_max, (yr_min, yr_max))
+else:
+    year_range = (yr_min, yr_max)
 
 st.sidebar.divider()
 st.sidebar.header("Risk Classification Thresholds")
@@ -345,10 +492,6 @@ scored["Reason"] = [
     for i in range(len(scored))
 ]
 
-# Historical track record per beneficiary (used only as a real, disclosed
-# signal in Early Warning -- not fed to the model).
-status_by_beneficiary = scored.groupby("Beneficiary_Name")["Completion_Status"].apply(list)
-
 # Apply sidebar filters -> filtered view used across tabs
 filt = scored.copy()
 if provinces:
@@ -359,7 +502,9 @@ if ownerships:
     filt = filt[filt["type_of_ownership"].isin(ownerships)]
 if sizes:
     filt = filt[filt["size_of_enterprise"].str.title().isin(sizes)]
-filt = filt[(filt["Year"] >= year_range[0]) & (filt["Year"] <= year_range[1])]
+if statuses:
+    filt = filt[filt["Proposal_Status"].isin(statuses)]
+filt = filt[filt["Year"].isna() | ((filt["Year"] >= year_range[0]) & (filt["Year"] <= year_range[1]))]
 
 filt = filt.sort_values("Completion_Probability", ascending=True).reset_index(drop=True)
 n_total_all = scored["Project_ID"].nunique()
@@ -436,8 +581,8 @@ with st.container():
     if search:
         s = search.lower()
         table = table[
-            table["Beneficiary_Name"].str.lower().str.contains(s)
-            | table["Project_ID"].str.lower().str.contains(s)
+            table["Beneficiary_Name"].str.lower().str.contains(s, regex=False)
+            | table["Project_ID"].str.lower().str.contains(s, regex=False)
         ]
 
     view = pd.DataFrame(
@@ -448,6 +593,8 @@ with st.container():
             "Sector": table["Sector"],
             "Enterprise Size": table["size_of_enterprise"].str.title(),
             "Total Assets": table["Total Assets"].map(lambda v: f"\u20b1{v:,.0f}"),
+            **({"Project Cost": table["Project_Cost"].map(lambda v: f"\u20b1{v:,.0f}" if pd.notna(v) else "\u2014")}
+               if "Project_Cost" in table and table["Project_Cost"].notna().any() else {}),
             "Completion Probability": (table["Completion_Probability"] * 100).round(1),
             "Risk Level": table["Risk_Level"],
             "Suggested Action": table["Suggested_Action"],
@@ -465,8 +612,7 @@ with st.container():
         },
     )
     st.caption(
-        f"{len(view)} project(s) shown. \"Total Assets\" is shown in place of Project Cost, which "
-        f"is not present in this dataset. Suggested actions are system-generated prioritization aids, "
+        f"{len(view)} project(s) shown. Suggested actions are system-generated prioritization aids, "
         f"not official DOST decisions."
     )
 
@@ -494,6 +640,10 @@ with st.container():
             st.write(f"**Province:** {prow['Province']}  \u00b7  **Sector:** {prow['Sector']}")
             st.write(f"**Ownership Type:** {prow['type_of_ownership']}  \u00b7  **Enterprise Size:** {prow['size_of_enterprise'].title()}")
             st.write(f"**Years in Operation:** {prow['Years in operation']:.0f}")
+            if pd.notna(prow.get("Project_Title")):
+                st.write(f"**Project Title:** {prow['Project_Title']}")
+            if pd.notna(prow.get("Proposal_Status")):
+                st.write(f"**Proposal Status:** {prow['Proposal_Status']}")
 
         with prob_col:
             st.markdown("###### Model Output")
@@ -518,6 +668,22 @@ with st.container():
             ncols[i % 4].metric(NUMERIC_LABELS.get(col, col), disp)
 
         st.caption(f"**Why flagged:** {prow['Reason']}")
+
+        if not audit_df.empty:
+            with st.expander("How these inputs were computed from the proposal (audit trail)"):
+                a = audit_df[audit_df["Project_ID"] == selected_pid].copy()
+                a["Value"] = a["Value"].map(
+                    lambda v: "\u2014" if v is None or (isinstance(v, float) and np.isnan(v))
+                    else (f"{v:,.2f}" if isinstance(v, (int, float)) else str(v)))
+                st.dataframe(
+                    a[["Variable", "Value", "Status", "Check", "Formula", "Inputs", "Source"]],
+                    hide_index=True, width="stretch",
+                )
+                st.caption(
+                    "Status: ok = read directly; fallback = primary source (e.g. PIS) unavailable, proposal value used; "
+                    "assumed = a documented assumption was needed; missing = could not be read. "
+                    "Year-based variables (income statement, cash flow, balance sheet) use Year 0, the year before funding."
+                )
 
         st.markdown("###### Feature Contribution to This Project's Score")
         st.caption(
@@ -656,6 +822,11 @@ with st.container():
     sector_avg = filt.groupby("Sector")["Completion_Pct"].transform("mean")
     filt = filt.assign(_sector_avg=sector_avg)
 
+    has_status = "Completion_Status" in scored.columns
+    if has_status:
+        _nc = scored[scored["Completion_Status"] == "Not Completed"].groupby("Beneficiary_Name").size().to_dict()
+    unmapped_ids = {u[0] for u in unmapped_categories}
+
     flags_rows = []
     for _, r in filt.iterrows():
         flags = []
@@ -666,15 +837,13 @@ with st.container():
         if gap >= peer_gap_pts:
             flags.append(f"{gap:.0f} pts below its sector's average completion probability")
 
-        others = [
-            s for name2, s in zip(
-                scored[scored["Beneficiary_Name"] == r["Beneficiary_Name"]]["Project_ID"],
-                scored[scored["Beneficiary_Name"] == r["Beneficiary_Name"]]["Completion_Status"],
-            )
-            if name2 != r["Project_ID"]
-        ]
-        if any(s == "Not Completed" for s in others):
-            flags.append("Beneficiary has another project on record marked 'Not Completed'")
+        if has_status:
+            others_nc = _nc.get(r["Beneficiary_Name"], 0) - (1 if r["Completion_Status"] == "Not Completed" else 0)
+            if others_nc > 0:
+                flags.append("Beneficiary has another project record marked 'Not Completed'")
+
+        if r["Project_ID"] in unmapped_ids:
+            flags.append("Category value unseen by the model (score less reliable)")
 
         if flags:
             flags_rows.append(
@@ -712,10 +881,13 @@ with st.container():
     st.markdown("##### Intervention Monitoring Log")
     st.caption(
         "System suggestions for prioritization \u2014 not official DOST decisions. "
-        "Status, personnel, follow-up dates, and remarks are editable and kept for this session."
+        "Status, personnel, follow-up dates, and remarks are editable and kept for this browser session "
+        "(download the CSV to keep a record)."
     )
 
-    at_risk_now = filt[filt["Risk_Level"] != "Low"].copy()
+    at_risk_now = scored[scored["Risk_Level"] != "Low"].copy()
+    _risk_map = scored.set_index("Project_ID")["Risk_Level"].to_dict()
+    _action_map = scored.set_index("Project_ID")["Suggested_Action"].to_dict()
 
     if "intervention_log" not in st.session_state:
         st.session_state.intervention_log = pd.DataFrame(
@@ -754,6 +926,12 @@ with st.container():
         else:
             st.info("No new at-risk projects to add.")
 
+    # keep Risk Level / Suggested Action current when thresholds or data change
+    _log = st.session_state.intervention_log.copy()
+    _log["Risk Level"] = _log["Project ID"].map(_risk_map).fillna(_log["Risk Level"])
+    _log["Suggested Action"] = _log["Project ID"].map(_action_map).fillna(_log["Suggested Action"])
+    st.session_state.intervention_log = _log
+
     edited = st.data_editor(
         st.session_state.intervention_log,
         hide_index=True,
@@ -781,8 +959,8 @@ with st.container():
 
 st.divider()
 st.caption(
-    "Model: Logistic Regression (StandardScaler + OneHotEncoder, L2 penalty) on Debt-Service Coverage, "
-    "Penetration Rate, Net Profit Margin, Current Capacity Utilization, Total Employment, Total Assets, "
-    "Years in Operation, Province, Sector, Ownership Type, and Enterprise Size. "
+    "Model: Logistic Regression on " + ", ".join(NUMERIC_LABELS.get(c, c).split(" (")[0] for c in numeric_cols)
+    + (", " + ", ".join(c for c in feat_cols if c in CATEGORICAL_COLS) if any(c in CATEGORICAL_COLS for c in feat_cols) else "")
+    + ". "
     "Risk tiers shown are a Proposed / System Risk Classification, not official DOST standards."
 )
